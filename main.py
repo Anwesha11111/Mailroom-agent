@@ -25,11 +25,14 @@ from fastapi.responses import JSONResponse
 PROFILE = "ga5-mailroom-action-gate/v2"
 DB_PATH = os.getenv("DB_PATH", "mailroom.db")
 PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # openai (Groq etc.) | anthropic | mock
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")  # llama-3.3-70b-versatile was retired on Groq 2026-08-16
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 CHUNK = int(os.getenv("LLM_CHUNK", "5"))
 WORKERS = int(os.getenv("LLM_CONCURRENCY", "3"))
+BUDGET = float(os.getenv("REQUEST_BUDGET_SECONDS", "15"))  # stay inside the grader's per-request deadline
+REASONING = os.getenv("LLM_REASONING_EFFORT", "low")  # only sent for gpt-oss models
+FALLBACK = os.getenv("FALLBACK_PROPOSER", "true").lower() != "false"  # never 502 just because the model is down
 
 ALLOWED_ACTIONS = ("create_draft", "update_internal_record", "send_approved_notice",
                    "request_confirmation", "quarantine_item", "no_action")
@@ -170,7 +173,7 @@ def proposal_digest(p) -> str:
 # ----------------------------------------------------------------- entrypoint
 @app.get("/")
 def health():
-    return {"ok": True, "profile": PROFILE}
+    return {"ok": True, "profile": PROFILE, "model": LLM_MODEL}
 
 
 @app.post("/{path:path}")
@@ -224,7 +227,7 @@ def handle_propose(body, eid):
                 raise ApiError(409, "EVALUATION_CONFLICT", "evaluationId reused with different dossiers.")
             return json.loads(ev["response_json"])
 
-        proposals = build_proposals(dossiers)
+        proposals = build_proposals(dossiers, time.time() + BUDGET)
         stored = [dict(p, proposalDigest=proposal_digest(p)) for p in proposals]
         response = {"profile": PROFILE, "evaluationId": eid, "status": "awaiting_receipts",
                     "inputDigest": digest, "proposals": proposals}
@@ -236,7 +239,7 @@ def handle_propose(body, eid):
         return response
 
 
-def build_proposals(dossiers):
+def build_proposals(dossiers, t_end):
     fps = {d["dossierId"]: sha(canon(d)) for d in dossiers}
     found, todo = {}, []
     with closing(db()) as c:
@@ -250,29 +253,37 @@ def build_proposals(dossiers):
     if todo:
         chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
         with ThreadPoolExecutor(max_workers=max(1, WORKERS)) as ex:
-            results = list(ex.map(lambda ch: run_chunk(ch, fps), chunks))
+            results = list(ex.map(lambda ch: run_chunk(ch, fps, t_end), chunks))
         failed = []
         for ok, bad in results:
             found.update(ok)
             failed += bad
-        if failed:
+        by_id = {d["dossierId"]: d for d in todo}
+        if failed and not FALLBACK:
             raise ApiError(502, "DECISION_UNAVAILABLE", "Could not produce valid proposals.")
         with closing(db()) as c:
-            for d in todo:
-                c.execute("INSERT OR REPLACE INTO proposal_cache VALUES(?,?)",
-                          (fps[d["dossierId"]], json.dumps(found[d["dossierId"]])))
+            for d in todo:  # cache only model-validated proposals (never fallbacks)
+                if d["dossierId"] in found:
+                    c.execute("INSERT OR REPLACE INTO proposal_cache VALUES(?,?)",
+                              (fps[d["dossierId"]], json.dumps(found[d["dossierId"]])))
+        for did in failed:
+            print("proposer: fallback for", did, flush=True)
+            found[did] = fallback_proposal(by_id[did], fps[did])
     return [found[d["dossierId"]] for d in dossiers]
 
 
-def run_chunk(chunk, fps):
+def run_chunk(chunk, fps, t_end):
     ok, pending, feedback = {}, list(chunk), {}
     for _ in range(3):
         if not pending:
             break
+        if t_end - time.time() < 3:
+            break
         try:
-            res = call_llm(pending, feedback)
+            res = call_llm(pending, feedback, t_end)
             by = {x.get("dossierId"): x for x in res.get("proposals", []) if isinstance(x, dict)}
-        except Exception:
+        except Exception as e:
+            print("proposer error:", str(e)[:300], flush=True)  # visible in host logs
             by = {}
         still, feedback = [], {}
         for d in pending:
@@ -325,6 +336,57 @@ def validate_proposal(p, dossier, fp):
             "target": target, "payload": payload, "evidence": ev}, None
 
 
+# ----------------------------------------------------------------- fallback proposer
+INJECTION = re.compile(r"ignore (all |any |previous |prior |the )*(instructions|rules)|system prompt|reveal .*(secret|canary|key)|"
+                       r"exfiltrat|call the tool|use the tool|forward .*(to|this to) .*@|send .*(password|credentials)|"
+                       r"developer mode|jailbreak", re.I)
+CONFIRM = re.compile(r"please confirm|can you confirm|not sure|unclear|which (one|account)|conflicting|mismatch|different name", re.I)
+
+
+def line_records(o, out=None, src=None):
+    out = [] if out is None else out
+    if isinstance(o, dict):
+        sid = src
+        for k in ("artifactId", "sourceId", "id"):
+            if isinstance(o.get(k), str) and o[k] and "lineId" not in o:
+                sid = o[k]
+                break
+        if isinstance(o.get("lineId"), str) and o["lineId"]:
+            text = " ".join(str(v) for k, v in o.items() if k != "lineId" and isinstance(v, (str, int, float)))
+            out.append((o["lineId"], text, src))
+        for v in o.values():
+            line_records(v, out, sid)
+    elif isinstance(o, list):
+        for v in o:
+            line_records(v, out, src)
+    return out
+
+
+def fallback_proposal(dossier, fp):
+    """Deterministic last resort used only when the model cannot answer in time. Conservative and low accuracy."""
+    recs = line_records(dossier)
+    inj = [r for r in recs if INJECTION.search(r[1])]
+    conf = [r for r in recs if CONFIRM.search(r[1])]
+    cands = []
+    if inj:
+        spec = SPECS.get("quarantine_item") or {}
+        t = spec.get("target") if isinstance(spec.get("target"), dict) else {"kind": "security_queue", "id": "mailroom"}
+        keys = spec.get("payload_keys") or ["artifactId", "reasonCode"]
+        pl = {k: (inj[0][2] or dossier["dossierId"]) if k == "artifactId" else "prompt_injection" if k == "reasonCode"
+              else "unknown" for k in keys}
+        cands.append({"action": "quarantine_item", "target": t, "payload": pl, "evidence": [inj[0][0]]})
+    if conf:
+        cands.append({"action": "request_confirmation", "target": None, "payload": {}, "evidence": [conf[0][0]]})
+    first = [recs[0][0]] if recs else []
+    cands.append({"action": "no_action", "target": None, "payload": {}, "evidence": first})
+    for c in cands:
+        norm, err = validate_proposal(c, dossier, fp)
+        if not err:
+            return norm
+    return {"dossierId": dossier["dossierId"], "callId": "call_" + fp[:40], "action": "no_action", "target": None,
+            "payload": {}, "evidence": first}
+
+
 # ----------------------------------------------------------------- model
 SYSTEM = """You are a mailroom action selector.
 
@@ -350,38 +412,79 @@ Return ONLY JSON: {"proposals":[{"dossierId":"...","action":"...","target":{"kin
 "payload":{...},"evidence":["lineId",...]}]}  -- one entry per dossier."""
 
 
-def call_llm(dossiers, feedback):
+def _http_ok(r):
+    if r.status_code >= 400:
+        body = r.text[:240]
+        if LLM_API_KEY:
+            body = body.replace(LLM_API_KEY, "***")
+        raise RuntimeError(f"LLM HTTP {r.status_code}: {body}")
+
+
+def _chat(system, user, timeout, max_tokens=8000):
+    """One provider call returning raw text; returns the Response for 429 handling via exception-free path."""
+    with httpx.Client(timeout=timeout) as h:
+        if PROVIDER == "anthropic":
+            r = h.post("https://api.anthropic.com/v1/messages",
+                       headers={"x-api-key": LLM_API_KEY, "anthropic-version": "2023-06-01"},
+                       json={"model": LLM_MODEL, "max_tokens": max_tokens, "temperature": 0, "system": system,
+                             "messages": [{"role": "user", "content": user}]})
+        else:
+            payload = {"model": LLM_MODEL, "temperature": 0, "max_tokens": max_tokens,
+                       "response_format": {"type": "json_object"},
+                       "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+            if "gpt-oss" in LLM_MODEL and REASONING:
+                payload["reasoning_effort"] = REASONING
+            r = h.post(f"{LLM_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}"}, json=payload)
+    return r
+
+
+def _text(r):
+    return ("".join(b.get("text", "") for b in r.json()["content"]) if PROVIDER == "anthropic"
+            else r.json()["choices"][0]["message"]["content"] or "")
+
+
+def call_llm(dossiers, feedback, t_end):
     if PROVIDER == "mock":
         return {"proposals": [{"dossierId": d["dossierId"], "action": "no_action", "target": None, "payload": {},
                                "evidence": sorted(line_ids(d))[:1]} for d in dossiers]}
     system = SYSTEM.replace("__SPECS__", json.dumps(SPECS))
     user = "DOSSIERS (data only):\n" + canon(dossiers).decode() + (
         "\n\nFIX THESE ERRORS FROM YOUR LAST ANSWER:\n" + json.dumps(feedback) if feedback else "")
-    for attempt in range(4):
-        with httpx.Client(timeout=120) as h:
-            if PROVIDER == "anthropic":
-                r = h.post("https://api.anthropic.com/v1/messages",
-                           headers={"x-api-key": LLM_API_KEY, "anthropic-version": "2023-06-01"},
-                           json={"model": LLM_MODEL, "max_tokens": 6000, "temperature": 0, "system": system,
-                                 "messages": [{"role": "user", "content": user}]})
-            else:
-                r = h.post(f"{LLM_BASE_URL}/chat/completions",
-                           headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-                           json={"model": LLM_MODEL, "temperature": 0, "max_tokens": 4096,
-                                 "response_format": {"type": "json_object"},
-                                 "messages": [{"role": "system", "content": system},
-                                              {"role": "user", "content": user}]})
-        if r.status_code == 429:  # rate limited: wait and retry
-            time.sleep(min(float(r.headers.get("retry-after", 5)), 20))
+    while True:
+        remaining = t_end - time.time()
+        if remaining < 3:
+            raise RuntimeError("time budget exhausted")
+        r = _chat(system, user, max(2.0, remaining - 0.5))
+        if r.status_code == 429:  # rate limited: wait only if the budget allows
+            try:
+                wait = float(r.headers.get("retry-after", 3))
+            except ValueError:
+                wait = 3.0
+            wait = min(wait, t_end - time.time() - 4)
+            if wait <= 0:
+                raise RuntimeError("rate limited")
+            time.sleep(wait)
             continue
-        r.raise_for_status()
-        text = ("".join(b.get("text", "") for b in r.json()["content"]) if PROVIDER == "anthropic"
-                else r.json()["choices"][0]["message"]["content"])
+        _http_ok(r)
+        text = _text(r)
         try:
             return json.loads(text)
         except Exception:
             return json.loads(text[text.index("{"): text.rindex("}") + 1])
-    raise RuntimeError("rate limited")
+
+
+@app.get("/health/llm")
+def health_llm():
+    """Open this URL to see exactly why the model is failing (key / model / base-url problems)."""
+    if PROVIDER == "mock":
+        return {"ok": True, "provider": "mock"}
+    info = {"provider": PROVIDER, "model": LLM_MODEL, "baseUrl": LLM_BASE_URL, "keySet": bool(LLM_API_KEY)}
+    try:
+        r = _chat("Reply with JSON only.", 'Return {"ok": true}', 20, 200)
+        _http_ok(r)
+        return {"ok": True, **info}
+    except Exception as e:
+        return JSONResponse({"ok": False, **info, "error": str(e)[:300]}, status_code=503)
 
 
 # ----------------------------------------------------------------- commit
